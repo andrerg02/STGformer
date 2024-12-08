@@ -296,7 +296,7 @@ class STGformer(nn.Module):
             self.model_dim, self.model_dim, (1, kernel_size[0]), 1, 0
         )
 
-    def forward(self, x):
+    def forward(self, x, A):
         # x: (batch_size, in_steps, num_nodes, input_dim+tod+dow=3)
         batch_size = x.shape[0]
 
