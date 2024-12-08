@@ -74,12 +74,12 @@ class SpatioTemporalLinearizedAttention(nn.Module):
         Q = nn.functional.normalize(Q, dim=-1) # Q é T x N x C
         K = nn.functional.normalize(K, dim=-1)
         ones = torch.ones(N, device=K.device)
-        print(Q.size(), K.size(), V.size(), ones.size())
-        print(torch.matmul(K.transpose(1,3), ones).size())
-        D = torch.matmul(Q.transpose(1,3), torch.matmul(K.transpose(1,3), ones)) + N * ones
-        QK = torch.bmm(Q, K.transpose(2,3)) if spatial else torch.bmm(Q.transpose(2,3), K)
-        QKVNV = torch.bmm(QK, V) + N * V
-        out = QKVNV / D[: , None]
+        K1 = torch.matmul(K.transpose(1,3), ones)
+        D = (Q @ K1[:, None, ...]).sum(dim=-1)
+        D += torch.ones_like(D) * N
+        QK = Q @ K.transpose(2,3) if spatial else (Q @ K.transpose(2,3)).transpose(2,3)
+        QKVNV = QK @ V + N * V
+        out = QKVNV / D[... , None]
         return out
 
     def forward(self, h):
@@ -102,15 +102,15 @@ class SelfAttention(nn.Module):
         for i in range(0, order):
             nn.init.constant_(self.pws[i].weight, 0)
             nn.init.constant_(self.pws[i].bias, 0)
-        self.fc = nn.Sequential(nn.Linear(model_dim, model_dim * mlp_ratio), nn.ReLU(), nn.Dropout(dropout))
+        self.fc = nn.Sequential(nn.Linear(model_dim, model_dim * mlp_ratio), nn.ReLU(), nn.Dropout(dropout), nn.Linear(model_dim * mlp_ratio, model_dim), nn.Dropout(dropout))
         self.ln1 = nn.LayerNorm(model_dim)
         self.ln2 = nn.LayerNorm(model_dim)
         self.dropout = nn.Dropout(dropout)
         self.scale = [1, 0.01, 0.001]
 
-    def forward(self, x):
-        c, x_glo = x
-        for i,z in enumerate(x):
+    def forward(self, x, x_graph):
+        c = x_glo = x
+        for i, z in enumerate(x_graph):
             att_outputs = self.attn[i](z)
             x_glo += att_outputs * self.pws[i](c) * self.scale[i]
             c = att_outputs
@@ -148,8 +148,8 @@ class STGformer2(nn.Module):
         self.dropout = nn.Dropout(dropout_a)
         self.pooling = nn.AvgPool2d(kernel_size=(1, kernel_size[0]), stride=1)
         self.attn = nn.ModuleList([SelfAttention(self.model_dim, mlp_ratio, num_heads, dropout) for size in kernel_size])
-        self.encoder1 = nn.Linear(in_steps, sum(k-1 for k in kernel_size) * self.model_dim, self.model_dim)
-        self.encoder2 = nn.ModuleList([nn.Sequential(nn.Linear(self.model_dim, self.model_dim * mlp_ratio), nn.ReLU(), nn.Dropout(dropout)) for _ in range(num_layers)])
+        self.encoder1 = nn.Linear((in_steps - sum(k - 1 for k in kernel_size)) * self.model_dim, self.model_dim)
+        self.encoder2 = nn.ModuleList([nn.Sequential(nn.Linear(self.model_dim, self.model_dim * mlp_ratio), nn.ReLU(), nn.Dropout(dropout), nn.Linear(self.model_dim * mlp_ratio, self.model_dim), nn.Dropout(dropout)) for _ in range(num_layers)])
         self.fc2 = nn.Linear(self.model_dim, out_steps * output_dim)
         self.conv = nn.Conv2d(self.model_dim, self.model_dim, (1, kernel_size[0]), 1, 0)
 
@@ -206,11 +206,11 @@ class STGformer2(nn.Module):
         order = 2 #fixing order, but could be passed as argument
         for attn in self.attn:
             p = self.graph_propagation(x, graph, order, A)
-            x = attn(p)
+            x = attn(x, p)
         x = self.encoder1(x.transpose(1, 2).flatten(-2)) #need to check why this is necessary (the transpose and flatten). actually need to check all this final part
         for layer in self.encoder2:
             x = x + layer(x)
         x = self.fc2(x).view(batch_size, self.num_nodes, self.out_steps, self.output_dim)
-        x = x.tranpose(1, 2)
+        x = x.transpose(1, 2)
 
         return x
