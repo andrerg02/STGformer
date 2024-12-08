@@ -27,19 +27,20 @@ from lib.utils import (
 from lib.metrics import RMSE_MAE_MAPE
 from lib.data_prepare import get_dataloaders_from_index_data
 from model.STGformer import STGformer
+from model.STGformer2 import STGformer2
 
 # ! X shape: (B, T, N, C)
 
 
 @torch.no_grad()
-def eval_model(model, valset_loader, criterion):
+def eval_model(model, valset_loader, criterion, A):
     model.eval()
     batch_loss_list = []
     for x_batch, y_batch in valset_loader:
         x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
 
-        out_batch = model(x_batch)
+        out_batch = model(x_batch, A)
         out_batch = SCALER.inverse_transform(out_batch)
         loss = criterion(out_batch, y_batch)
         batch_loss_list.append(loss.item())
@@ -48,7 +49,7 @@ def eval_model(model, valset_loader, criterion):
 
 
 @torch.no_grad()
-def predict(model, loader):
+def predict(model, loader, A):
     model.eval()
     y = []
     out = []
@@ -56,7 +57,7 @@ def predict(model, loader):
     for x_batch, y_batch in loader:
         x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
-        out_batch = model(x_batch)
+        out_batch = model(x_batch, A)
         out_batch = SCALER.inverse_transform(out_batch)
 
         out_batch = out_batch.cpu().numpy()
@@ -71,7 +72,7 @@ def predict(model, loader):
 
 
 def train_one_epoch(
-    model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=None
+    model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=None, A=None
 ):
     global cfg, global_iter_count, global_target_length
 
@@ -80,7 +81,7 @@ def train_one_epoch(
     for x_batch, y_batch in trainset_loader:
         x_batch = x_batch.to(DEVICE)
         y_batch = y_batch.to(DEVICE)
-        out_batch = model(x_batch)
+        out_batch = model(x_batch, A)
         out_batch = SCALER.inverse_transform(out_batch)
 
         loss = criterion(out_batch, y_batch)
@@ -113,6 +114,7 @@ def train(
     plot=False,
     log=None,
     save=None,
+    A=None,
 ):
     model = model.to(DEVICE)
 
@@ -124,14 +126,14 @@ def train(
 
     for epoch in range(max_epochs):
         train_loss = train_one_epoch(
-            model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=log
+            model, trainset_loader, optimizer, scheduler, criterion, clip_grad, log=log, A=A
         )
         train_loss_list.append(train_loss)
 
-        val_loss = eval_model(model, valset_loader, masked_mae_loss)
+        val_loss = eval_model(model, valset_loader, masked_mae_loss, A)
         val_loss_list.append(val_loss)
 
-        test_loss = eval_model(model, testset_loader, masked_mae_loss)
+        test_loss = eval_model(model, testset_loader, masked_mae_loss, A)
 
         if (epoch + 1) % verbose == 0:
             print_log(
@@ -155,8 +157,8 @@ def train(
                 break
 
     model.load_state_dict(best_state_dict)
-    train_rmse, train_mae, train_mape = RMSE_MAE_MAPE(*predict(model, trainset_loader))
-    val_rmse, val_mae, val_mape = RMSE_MAE_MAPE(*predict(model, valset_loader))
+    train_rmse, train_mae, train_mape = RMSE_MAE_MAPE(*predict(model, trainset_loader, A))
+    val_rmse, val_mae, val_mape = RMSE_MAE_MAPE(*predict(model, valset_loader, A))
 
     out_str = f"Early stopping at epoch: {epoch+1}\n"
     out_str += f"Best at epoch {best_epoch+1}:\n"
@@ -189,12 +191,12 @@ def train(
 
 
 @torch.no_grad()
-def test_model(model, testset_loader, log=None):
+def test_model(model, testset_loader, log=None, A=None):
     model.eval()
     print_log("--------- Test ---------", log=log)
 
     start = time.time()
-    y_true, y_pred = predict(model, testset_loader)
+    y_true, y_pred = predict(model, testset_loader, A)
     end = time.time()
 
     rmse_all, mae_all, mape_all = RMSE_MAE_MAPE(y_true, y_pred)
@@ -228,7 +230,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     seed = torch.randint(1000, (1,))  # set random seed here
-    seed_everything(seed)
+    seed_everything(seed.item())
     set_cpu_num(1)
 
     GPU_ID = args.gpu_num
@@ -238,7 +240,7 @@ if __name__ == "__main__":
     dataset = args.dataset
     dataset = dataset.upper()
     data_path = f"../data/{dataset}"
-    model_name = STGformer.__name__
+    model_name = STGformer2.__name__
 
     with open(f"{model_name}.yaml", "r") as f:
         cfg = yaml.safe_load(f)
@@ -276,7 +278,7 @@ if __name__ == "__main__":
     # ---------------------- set loss, optimizer, scheduler ---------------------- #
     from functools import partial
 
-    model = partial(STGformer, supports=supports)
+    model = partial(STGformer2, supports=supports)
     model = model(**cfg["model_args"])
     criterion = MaskedHuberLoss()  # MaskedMAELoss()
     optimizer = torch.optim.Adam(
@@ -314,19 +316,19 @@ if __name__ == "__main__":
     print_log(
         json.dumps(cfg, ensure_ascii=False, indent=4, cls=CustomJSONEncoder), log=log
     )
-    print_log(
-        summary(
-            model,
-            [
-                cfg["batch_size"],
-                cfg["in_steps"],
-                cfg["num_nodes"],
-                next(iter(trainset_loader))[0].shape[-1],
-            ],
-            verbose=0,  # avoid print twice
-        ),
-        log=log,
-    )
+    # print_log(
+    #     summary(
+    #         model,
+    #         [
+    #             cfg["batch_size"],
+    #             cfg["in_steps"],
+    #             cfg["num_nodes"],
+    #             next(iter(trainset_loader))[0].shape[-1],
+    #         ],
+    #         verbose=0,  # avoid print twice
+    #     ),
+    #     log=log,
+    # )
     print_log(log=log)
 
     # --------------------------- train and test model --------------------------- #
@@ -349,9 +351,10 @@ if __name__ == "__main__":
             verbose=1,
             log=log,
             save=save,
+            A=adj_mx[0],
         )
         print_log(f"Saved Model: {save}", log=log)
 
-    test_model(model, testset_loader, log=log)
+    test_model(model, testset_loader, log=log, A=adj_mx[0])
 
     log.close()
